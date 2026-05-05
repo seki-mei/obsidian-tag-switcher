@@ -1,0 +1,9 @@
+{
+  "id": "tag-switcher",
+  "name": "Tag Switcher",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "Two-stage tag → file switcher: pick a tag from the current file, then pick a file with that tag.",
+  "author": "you",
+  "isDesktopOnly": false
+}
