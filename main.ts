@@ -102,7 +102,7 @@ export default class TagSwitcherPlugin extends Plugin {
   async onload() {
     this.addCommand({
       id: "open-tag-switcher",
-      name: "Switch file by tag (current file's tags)",
+      name: "Switch file by tag menu",
       callback: () => this.openTagSwitcher(),
     });
   }
