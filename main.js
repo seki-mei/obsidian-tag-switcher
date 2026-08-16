@@ -28,13 +28,29 @@ var import_obsidian = require("obsidian");
 var AYS_PLUGIN_ID = "obsidian-another-quick-switcher";
 var AYS_SEARCH_PREFIX = `${AYS_PLUGIN_ID}:search-command_`;
 var TagPickerModal = class extends import_obsidian.SuggestModal {
-  constructor(app, tags, onChoose) {
+  // backTargets, if given, hardcodes the same Ctrl+Shift+Space /
+  // Ctrl+Alt+Space combos used inside AYS — via Modal's own `this.scope`,
+  // the real supported API for modal-local hotkeys (pushed onto Obsidian's
+  // keymap stack on open, popped on close). Simpler and more robust than
+  // the raw-DOM-listener approach openSwitcherWithQuery needs for AYS,
+  // since we own this class and don't need to guess when it's mounted.
+  constructor(app, tags, onChoose, backTargets) {
     super(app);
     __publicField(this, "tags");
     __publicField(this, "onChoose");
     this.tags = tags;
     this.setPlaceholder("Pick a tag\u2026");
     this.onChoose = onChoose;
+    if (backTargets) {
+      this.scope.register(["Ctrl", "Shift"], " ", () => {
+        this.close();
+        backTargets.showNoteTags();
+      });
+      this.scope.register(["Ctrl", "Alt"], " ", () => {
+        this.close();
+        backTargets.showVaultTags();
+      });
+    }
   }
   getSuggestions(query) {
     const q = query.toLowerCase();
@@ -92,7 +108,7 @@ function findAYSTagCommand(app) {
   }
   return Object.keys(registeredCommands).find((id) => id.startsWith(AYS_SEARCH_PREFIX)) ?? null;
 }
-function openSwitcherWithQuery(app, query, onBack) {
+function openSwitcherWithQuery(app, query, backTargets) {
   const commands = app.commands;
   const aysCommand = findAYSTagCommand(app);
   if (!aysCommand) {
@@ -102,20 +118,42 @@ function openSwitcherWithQuery(app, query, onBack) {
   commands.executeCommandById(aysCommand);
   setTimeout(() => {
     const input = document.activeElement;
-    if (!input || input.tagName !== "INPUT") return;
+    console.log("[TagSwitcher] post-executeCommand activeElement:", input, "tag:", input?.tagName);
+    if (!input || input.tagName !== "INPUT") {
+      console.log("[TagSwitcher] activeElement is not an INPUT \u2014 aborting, listener never attached");
+      return;
+    }
     input.value = query + " ";
     input.dispatchEvent(new InputEvent("input", { bubbles: true }));
-    if (!onBack) return;
+    if (!backTargets) return;
     const activeInput = input;
+    console.log("[TagSwitcher] attaching Ctrl+Shift+Space / Ctrl+Alt+Space listeners to", activeInput);
     const handleKeydown = (ev) => {
-      if (!ev.altKey || ev.key !== "ArrowLeft") return;
+      console.log(
+        "[TagSwitcher] keydown on AYS input:",
+        ev.key,
+        "code:",
+        ev.code,
+        "ctrl:",
+        ev.ctrlKey,
+        "shift:",
+        ev.shiftKey,
+        "alt:",
+        ev.altKey
+      );
+      const isNoteCombo = ev.ctrlKey && ev.shiftKey && !ev.altKey && ev.code === "Space";
+      const isVaultCombo = ev.ctrlKey && ev.altKey && !ev.shiftKey && ev.code === "Space";
+      if (!isNoteCombo && !isVaultCombo) return;
+      console.log("[TagSwitcher]", isNoteCombo ? "Ctrl+Shift+Space" : "Ctrl+Alt+Space", "matched, jumping");
       ev.preventDefault();
       ev.stopPropagation();
       cleanup();
       activeInput.dispatchEvent(
         new KeyboardEvent("keydown", { key: "Escape", bubbles: true })
       );
-      onBack();
+      console.log("[TagSwitcher] Escape dispatched, jumping to", isNoteCombo ? "note tags" : "vault tags");
+      if (isNoteCombo) backTargets.showNoteTags();
+      else backTargets.showVaultTags();
     };
     const observer = new MutationObserver(() => {
       if (!document.body.contains(activeInput)) cleanup();
@@ -132,8 +170,8 @@ var TagSwitcherPlugin = class extends import_obsidian.Plugin {
   async onload() {
     this.addCommand({
       id: "open-tag-switcher",
-      name: "Switch file by tag menu",
-      callback: () => this.openTagSwitcher()
+      name: "Switch file by tag menu (current note's tags)",
+      callback: () => this.openNoteTagSwitcher()
     });
     this.addCommand({
       id: "open-vault-tag-switcher",
@@ -141,34 +179,39 @@ var TagSwitcherPlugin = class extends import_obsidian.Plugin {
       callback: () => this.openVaultTagSwitcher()
     });
   }
-  openTagSwitcher() {
+  // Idempotent: reached via its own command/hotkey, or via Ctrl+Shift+Space
+  // from inside AYS, this always does the same thing — show the current
+  // note's tag picker. No skip-if-only-one-tag shortcut anymore: that
+  // would make the action's result depend on how it was triggered, which
+  // is exactly what idempotency rules out.
+  openNoteTagSwitcher() {
     const tags = getTagsForActiveFile(this.app);
     if (tags.length === 0) {
       new import_obsidian.Notice("Tag Switcher: the active file has no tags.");
       return;
     }
-    if (tags.length === 1) {
-      openSwitcherWithQuery(this.app, tags[0]);
-      return;
-    }
+    const backTargets = {
+      showNoteTags: () => this.openNoteTagSwitcher(),
+      showVaultTags: () => this.openVaultTagSwitcher()
+    };
     new TagPickerModal(this.app, tags, (tag) => {
-      openSwitcherWithQuery(this.app, tag);
-    }).open();
+      openSwitcherWithQuery(this.app, tag, backTargets);
+    }, backTargets).open();
   }
-  // Vault-wide variant: always shows the picker (even for 1 tag, since
-  // "all tags" implies browsing, not a quick single-tag jump), and lets
-  // Alt+Left from inside AYS reopen this same picker.
+  // Idempotent counterpart: always shows every tag in the vault, however
+  // it's reached.
   openVaultTagSwitcher() {
     const tags = getAllVaultTags(this.app);
     if (tags.length === 0) {
       new import_obsidian.Notice("Tag Switcher: no tags found in this vault.");
       return;
     }
-    const showPicker = () => {
-      new TagPickerModal(this.app, tags, (tag) => {
-        openSwitcherWithQuery(this.app, tag, showPicker);
-      }).open();
+    const backTargets = {
+      showNoteTags: () => this.openNoteTagSwitcher(),
+      showVaultTags: () => this.openVaultTagSwitcher()
     };
-    showPicker();
+    new TagPickerModal(this.app, tags, (tag) => {
+      openSwitcherWithQuery(this.app, tag, backTargets);
+    }, backTargets).open();
   }
 };

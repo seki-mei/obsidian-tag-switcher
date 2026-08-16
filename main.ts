@@ -3,19 +3,51 @@ import { App, Notice, Plugin, SuggestModal } from "obsidian";
 const AYS_PLUGIN_ID = "obsidian-another-quick-switcher";
 const AYS_SEARCH_PREFIX = `${AYS_PLUGIN_ID}:search-command_`;
 
+// The two states this plugin can put things into. Symmetric on purpose:
+// whether a state is reached for the first time via its Obsidian-configured
+// hotkey, via Ctrl+Shift+Space/Ctrl+Alt+Space from inside AYS, or from
+// inside the picker modal itself, the result is identical. No shortcuts
+// that would make "trigger this action" behave differently depending on
+// how you got here.
+interface AysBackTargets {
+  showNoteTags: () => void;
+  showVaultTags: () => void;
+}
+
 // ── Tag picker modal ────────────────────────────────────────────────────────
 
 class TagPickerModal extends SuggestModal<string> {
   private tags: string[];
   private onChoose: (tag: string) => void;
 
-  constructor(app: App, tags: string[], onChoose: (tag: string) => void) {
+  // backTargets, if given, hardcodes the same Ctrl+Shift+Space /
+  // Ctrl+Alt+Space combos used inside AYS — via Modal's own `this.scope`,
+  // the real supported API for modal-local hotkeys (pushed onto Obsidian's
+  // keymap stack on open, popped on close). Simpler and more robust than
+  // the raw-DOM-listener approach openSwitcherWithQuery needs for AYS,
+  // since we own this class and don't need to guess when it's mounted.
+  constructor(
+    app: App,
+    tags: string[],
+    onChoose: (tag: string) => void,
+    backTargets?: AysBackTargets
+  ) {
     super(app);
     this.tags = tags;
     this.setPlaceholder("Pick a tag…");
     this.onChoose = onChoose;
-  }
 
+    if (backTargets) {
+      this.scope.register(["Ctrl", "Shift"], " ", () => {
+        this.close();
+        backTargets.showNoteTags();
+      });
+      this.scope.register(["Ctrl", "Alt"], " ", () => {
+        this.close();
+        backTargets.showVaultTags();
+      });
+    }
+  }
 
   getSuggestions(query: string): string[] {
     const q = query.toLowerCase();
@@ -113,12 +145,27 @@ function findAYSTagCommand(app: App): string | null {
 // Open AYS with a pre-seeded query. Uses document.activeElement right after
 // the modal mounts — more reliable than a fixed CSS selector.
 //
-// onBack, if given, wires Alt+Left inside the AYS input to close AYS and
-// invoke onBack (e.g. "reopen the tag list"). The listener is on the input
-// itself and removes itself on any close path (blur is not enough since AYS
-// may blur-then-refocus internally in some flows, so we also clean up via
-// a MutationObserver watching for the input leaving the DOM).
-function openSwitcherWithQuery(app: App, query: string, onBack?: () => void): void {
+// backTargets, if given, hardcodes two combos inside the AYS input:
+//   Ctrl+Shift+Space -> close AYS, show the current note's tag picker
+//   Ctrl+Alt+Space   -> close AYS, show the all-vault tag picker
+// Both are always wired, regardless of which one got us into AYS in the
+// first place — that's what makes them idempotent from the user's side.
+//
+// NOT Alt+Left/Escape — AYS itself binds Alt+Left to its own "Navigate
+// Back" (and Escape to its own close) via Obsidian's Scope/keymap system,
+// which resolves above plain DOM listeners, so a handler here would never
+// see those keystrokes no matter how it's attached. Ctrl+Shift+Space and
+// Ctrl+Alt+Space are unclaimed by both Obsidian core and AYS, so they reach
+// us untouched. These two are currently hardcoded here rather than
+// registered as real Obsidian hotkeys — deliberately, per your ask — so if
+// you rebind the top-level commands' hotkeys later, these two stay fixed
+// unless we come back and change them too.
+//
+// The listener is on the input itself and removes itself on any close path
+// (blur is not enough since AYS may blur-then-refocus internally in some
+// flows, so we also clean up via a MutationObserver watching for the input
+// leaving the DOM).
+function openSwitcherWithQuery(app: App, query: string, backTargets?: AysBackTargets): void {
   const commands = (app as any).commands;
   const aysCommand = findAYSTagCommand(app);
 
@@ -131,24 +178,47 @@ function openSwitcherWithQuery(app: App, query: string, onBack?: () => void): vo
 
   setTimeout(() => {
     const input = document.activeElement as HTMLInputElement | null;
-    if (!input || input.tagName !== "INPUT") return;
+    console.log("[TagSwitcher] post-executeCommand activeElement:", input, "tag:", input?.tagName);
+    if (!input || input.tagName !== "INPUT") {
+      console.log("[TagSwitcher] activeElement is not an INPUT — aborting, listener never attached");
+      return;
+    }
     input.value = query + " ";
     input.dispatchEvent(new InputEvent("input", { bubbles: true }));
 
-    if (!onBack) return;
+    if (!backTargets) return;
     const activeInput = input; // narrowed non-null, captured for closures below
+    console.log("[TagSwitcher] attaching Ctrl+Shift+Space / Ctrl+Alt+Space listeners to", activeInput);
 
     const handleKeydown = (ev: KeyboardEvent) => {
-      if (!ev.altKey || ev.key !== "ArrowLeft") return;
+      console.log(
+        "[TagSwitcher] keydown on AYS input:",
+        ev.key,
+        "code:", ev.code,
+        "ctrl:", ev.ctrlKey,
+        "shift:", ev.shiftKey,
+        "alt:", ev.altKey
+      );
+      const isNoteCombo = ev.ctrlKey && ev.shiftKey && !ev.altKey && ev.code === "Space";
+      const isVaultCombo = ev.ctrlKey && ev.altKey && !ev.shiftKey && ev.code === "Space";
+      if (!isNoteCombo && !isVaultCombo) return;
+
+      console.log("[TagSwitcher]", isNoteCombo ? "Ctrl+Shift+Space" : "Ctrl+Alt+Space", "matched, jumping");
       ev.preventDefault();
       ev.stopPropagation();
       cleanup();
       // AYS closes itself on Escape; simulate that to back out cleanly
-      // before handing control back to the caller.
+      // before handing control back to the caller. Unlike the Alt+Left
+      // case, this doesn't fight over a claimed binding — we WANT AYS's
+      // own Escape handling to fire, just triggered programmatically.
+      // Still unverified live: whether Obsidian's keymap dispatcher treats
+      // a synthetic (non-isTrusted) KeyboardEvent the same as a real one.
       activeInput.dispatchEvent(
         new KeyboardEvent("keydown", { key: "Escape", bubbles: true })
       );
-      onBack();
+      console.log("[TagSwitcher] Escape dispatched, jumping to", isNoteCombo ? "note tags" : "vault tags");
+      if (isNoteCombo) backTargets.showNoteTags();
+      else backTargets.showVaultTags();
     };
 
     const observer = new MutationObserver(() => {
@@ -169,10 +239,14 @@ function openSwitcherWithQuery(app: App, query: string, onBack?: () => void): vo
 
 export default class TagSwitcherPlugin extends Plugin {
   async onload() {
+    // No hotkeys assigned here — bind Ctrl+Shift+Space and Ctrl+Alt+Space
+    // to these two in Settings → Hotkeys yourself. The matching combos
+    // hardcoded inside openSwitcherWithQuery only fire once AYS is already
+    // open; these commands are what get you there in the first place.
     this.addCommand({
       id: "open-tag-switcher",
-      name: "Switch file by tag menu",
-      callback: () => this.openTagSwitcher(),
+      name: "Switch file by tag menu (current note's tags)",
+      callback: () => this.openNoteTagSwitcher(),
     });
 
     this.addCommand({
@@ -182,7 +256,12 @@ export default class TagSwitcherPlugin extends Plugin {
     });
   }
 
-  private openTagSwitcher(): void {
+  // Idempotent: reached via its own command/hotkey, or via Ctrl+Shift+Space
+  // from inside AYS, this always does the same thing — show the current
+  // note's tag picker. No skip-if-only-one-tag shortcut anymore: that
+  // would make the action's result depend on how it was triggered, which
+  // is exactly what idempotency rules out.
+  private openNoteTagSwitcher(): void {
     const tags = getTagsForActiveFile(this.app);
 
     if (tags.length === 0) {
@@ -190,20 +269,18 @@ export default class TagSwitcherPlugin extends Plugin {
       return;
     }
 
-    if (tags.length === 1) {
-      // Only one tag — skip the picker, go straight to AYS filtered by it
-      openSwitcherWithQuery(this.app, tags[0]);
-      return;
-    }
+    const backTargets: AysBackTargets = {
+      showNoteTags: () => this.openNoteTagSwitcher(),
+      showVaultTags: () => this.openVaultTagSwitcher(),
+    };
 
     new TagPickerModal(this.app, tags, (tag) => {
-      openSwitcherWithQuery(this.app, tag);
-    }).open();
+      openSwitcherWithQuery(this.app, tag, backTargets);
+    }, backTargets).open();
   }
 
-  // Vault-wide variant: always shows the picker (even for 1 tag, since
-  // "all tags" implies browsing, not a quick single-tag jump), and lets
-  // Alt+Left from inside AYS reopen this same picker.
+  // Idempotent counterpart: always shows every tag in the vault, however
+  // it's reached.
   private openVaultTagSwitcher(): void {
     const tags = getAllVaultTags(this.app);
 
@@ -212,12 +289,13 @@ export default class TagSwitcherPlugin extends Plugin {
       return;
     }
 
-    const showPicker = () => {
-      new TagPickerModal(this.app, tags, (tag) => {
-        openSwitcherWithQuery(this.app, tag, showPicker);
-      }).open();
+    const backTargets: AysBackTargets = {
+      showNoteTags: () => this.openNoteTagSwitcher(),
+      showVaultTags: () => this.openVaultTagSwitcher(),
     };
 
-    showPicker();
+    new TagPickerModal(this.app, tags, (tag) => {
+      openSwitcherWithQuery(this.app, tag, backTargets);
+    }, backTargets).open();
   }
 }
