@@ -34,11 +34,11 @@ var TagPickerModal = class extends import_obsidian.SuggestModal {
   // keymap stack on open, popped on close). Simpler and more robust than
   // the raw-DOM-listener approach openSwitcherWithQuery needs for AYS,
   // since we own this class and don't need to guess when it's mounted.
-  constructor(app, tags, onChoose, backTargets) {
+  constructor(app, entries, onChoose, backTargets) {
     super(app);
-    __publicField(this, "tags");
+    __publicField(this, "entries");
     __publicField(this, "onChoose");
-    this.tags = tags;
+    this.entries = entries;
     this.setPlaceholder("Pick a tag\u2026");
     this.onChoose = onChoose;
     if (backTargets) {
@@ -54,13 +54,19 @@ var TagPickerModal = class extends import_obsidian.SuggestModal {
   }
   getSuggestions(query) {
     const q = query.toLowerCase();
-    return this.tags.filter((t) => t.toLowerCase().includes(q));
+    return this.entries.filter((e) => e.tag.toLowerCase().includes(q));
   }
-  renderSuggestion(tag, el) {
-    el.createEl("span", { text: tag });
+  renderSuggestion(entry, el) {
+    el.createEl("span", { text: entry.tag });
+    if (entry.count !== void 0) {
+      el.createEl("span", {
+        text: ` (${entry.count})`,
+        cls: "tag-switcher-count"
+      });
+    }
   }
-  onChooseSuggestion(tag) {
-    this.onChoose(tag);
+  onChooseSuggestion(entry) {
+    this.onChoose(entry.tag);
   }
 };
 function getTagsForActiveFile(app) {
@@ -81,7 +87,7 @@ function getAllVaultTags(app) {
   const getTagsFn = app.metadataCache.getTags;
   if (typeof getTagsFn === "function") {
     const tagCounts = getTagsFn.call(app.metadataCache);
-    return Object.entries(tagCounts).sort((a, b) => b[1] - a[1]).map(([tag]) => tag);
+    return Object.entries(tagCounts).sort((a, b) => b[1] - a[1]).map(([tag, count]) => ({ tag, count }));
   }
   const seen = /* @__PURE__ */ new Map();
   for (const file of app.vault.getMarkdownFiles()) {
@@ -94,7 +100,7 @@ function getAllVaultTags(app) {
     }
     cache.tags?.forEach((t) => seen.set(t.tag, (seen.get(t.tag) ?? 0) + 1));
   }
-  return [...seen.entries()].sort((a, b) => b[1] - a[1]).map(([tag]) => tag);
+  return [...seen.entries()].sort((a, b) => b[1] - a[1]).map(([tag, count]) => ({ tag, count }));
 }
 function findAYSTagCommand(app) {
   const registeredCommands = app.commands?.commands ?? {};
@@ -179,11 +185,15 @@ var TagSwitcherPlugin = class extends import_obsidian.Plugin {
       callback: () => this.openVaultTagSwitcher()
     });
   }
-  // Idempotent: reached via its own command/hotkey, or via Ctrl+Shift+Space
-  // from inside AYS, this always does the same thing — show the current
-  // note's tag picker. No skip-if-only-one-tag shortcut anymore: that
-  // would make the action's result depend on how it was triggered, which
-  // is exactly what idempotency rules out.
+  // Reached via its own command/hotkey, via Ctrl+Shift+Space from inside
+  // AYS, or via Ctrl+Shift+Space from inside the picker itself — all three
+  // funnel through this one function, so the single-tag fast path below
+  // applies uniformly everywhere for free. This is the one deliberate
+  // exception to full idempotency: a single-tag note always jumps straight
+  // to AYS rather than showing a redundant one-item list, even when the
+  // jump is re-triggered from an AYS view that's already showing that tag
+  // (in which case it just closes and reopens AYS with the same query —
+  // a harmless no-op flicker, not a new state).
   openNoteTagSwitcher() {
     const tags = getTagsForActiveFile(this.app);
     if (tags.length === 0) {
@@ -194,15 +204,21 @@ var TagSwitcherPlugin = class extends import_obsidian.Plugin {
       showNoteTags: () => this.openNoteTagSwitcher(),
       showVaultTags: () => this.openVaultTagSwitcher()
     };
-    new TagPickerModal(this.app, tags, (tag) => {
+    if (tags.length === 1) {
+      openSwitcherWithQuery(this.app, tags[0], backTargets);
+      return;
+    }
+    const entries = tags.map((tag) => ({ tag }));
+    new TagPickerModal(this.app, entries, (tag) => {
       openSwitcherWithQuery(this.app, tag, backTargets);
     }, backTargets).open();
   }
   // Idempotent counterpart: always shows every tag in the vault, however
-  // it's reached.
+  // it's reached. No single-tag skip here — an empty-or-one-tag vault is
+  // an edge case, not a case worth optimizing for like the per-note one is.
   openVaultTagSwitcher() {
-    const tags = getAllVaultTags(this.app);
-    if (tags.length === 0) {
+    const entries = getAllVaultTags(this.app);
+    if (entries.length === 0) {
       new import_obsidian.Notice("Tag Switcher: no tags found in this vault.");
       return;
     }
@@ -210,7 +226,7 @@ var TagSwitcherPlugin = class extends import_obsidian.Plugin {
       showNoteTags: () => this.openNoteTagSwitcher(),
       showVaultTags: () => this.openVaultTagSwitcher()
     };
-    new TagPickerModal(this.app, tags, (tag) => {
+    new TagPickerModal(this.app, entries, (tag) => {
       openSwitcherWithQuery(this.app, tag, backTargets);
     }, backTargets).open();
   }

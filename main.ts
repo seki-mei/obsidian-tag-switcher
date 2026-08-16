@@ -14,10 +14,18 @@ interface AysBackTargets {
   showVaultTags: () => void;
 }
 
+// count is optional: note-mode entries don't have a meaningful per-tag
+// count (getTagsForActiveFile just dedupes into a Set), only vault-mode
+// entries carry one.
+interface TagEntry {
+  tag: string;
+  count?: number;
+}
+
 // ── Tag picker modal ────────────────────────────────────────────────────────
 
-class TagPickerModal extends SuggestModal<string> {
-  private tags: string[];
+class TagPickerModal extends SuggestModal<TagEntry> {
+  private entries: TagEntry[];
   private onChoose: (tag: string) => void;
 
   // backTargets, if given, hardcodes the same Ctrl+Shift+Space /
@@ -28,12 +36,12 @@ class TagPickerModal extends SuggestModal<string> {
   // since we own this class and don't need to guess when it's mounted.
   constructor(
     app: App,
-    tags: string[],
+    entries: TagEntry[],
     onChoose: (tag: string) => void,
     backTargets?: AysBackTargets
   ) {
     super(app);
-    this.tags = tags;
+    this.entries = entries;
     this.setPlaceholder("Pick a tag…");
     this.onChoose = onChoose;
 
@@ -49,17 +57,23 @@ class TagPickerModal extends SuggestModal<string> {
     }
   }
 
-  getSuggestions(query: string): string[] {
+  getSuggestions(query: string): TagEntry[] {
     const q = query.toLowerCase();
-    return this.tags.filter((t) => t.toLowerCase().includes(q));
+    return this.entries.filter((e) => e.tag.toLowerCase().includes(q));
   }
 
-  renderSuggestion(tag: string, el: HTMLElement): void {
-    el.createEl("span", { text: tag });
+  renderSuggestion(entry: TagEntry, el: HTMLElement): void {
+    el.createEl("span", { text: entry.tag });
+    if (entry.count !== undefined) {
+      el.createEl("span", {
+        text: ` (${entry.count})`,
+        cls: "tag-switcher-count",
+      });
+    }
   }
 
-  onChooseSuggestion(tag: string): void {
-    this.onChoose(tag);
+  onChooseSuggestion(entry: TagEntry): void {
+    this.onChoose(entry.tag);
   }
 }
 
@@ -93,14 +107,14 @@ function getTagsForActiveFile(app: App): string[] {
 // could change/disappear without notice. We cast through `any` and fall
 // back to a manual per-file scan if it's missing, so the plugin degrades
 // instead of throwing on some future Obsidian version.
-function getAllVaultTags(app: App): string[] {
+function getAllVaultTags(app: App): TagEntry[] {
   const getTagsFn = (app.metadataCache as any).getTags;
 
   if (typeof getTagsFn === "function") {
     const tagCounts: Record<string, number> = getTagsFn.call(app.metadataCache);
     return Object.entries(tagCounts)
       .sort((a, b) => b[1] - a[1])
-      .map(([tag]) => tag);
+      .map(([tag, count]) => ({ tag, count }));
   }
 
   // Fallback: walk every markdown file's cache and dedupe (documented APIs only).
@@ -117,7 +131,9 @@ function getAllVaultTags(app: App): string[] {
     cache.tags?.forEach((t) => seen.set(t.tag, (seen.get(t.tag) ?? 0) + 1));
   }
 
-  return [...seen.entries()].sort((a, b) => b[1] - a[1]).map(([tag]) => tag);
+  return [...seen.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([tag, count]) => ({ tag, count }));
 }
 
 // Find the best AYS command for tag-based search.
@@ -256,11 +272,15 @@ export default class TagSwitcherPlugin extends Plugin {
     });
   }
 
-  // Idempotent: reached via its own command/hotkey, or via Ctrl+Shift+Space
-  // from inside AYS, this always does the same thing — show the current
-  // note's tag picker. No skip-if-only-one-tag shortcut anymore: that
-  // would make the action's result depend on how it was triggered, which
-  // is exactly what idempotency rules out.
+  // Reached via its own command/hotkey, via Ctrl+Shift+Space from inside
+  // AYS, or via Ctrl+Shift+Space from inside the picker itself — all three
+  // funnel through this one function, so the single-tag fast path below
+  // applies uniformly everywhere for free. This is the one deliberate
+  // exception to full idempotency: a single-tag note always jumps straight
+  // to AYS rather than showing a redundant one-item list, even when the
+  // jump is re-triggered from an AYS view that's already showing that tag
+  // (in which case it just closes and reopens AYS with the same query —
+  // a harmless no-op flicker, not a new state).
   private openNoteTagSwitcher(): void {
     const tags = getTagsForActiveFile(this.app);
 
@@ -274,17 +294,24 @@ export default class TagSwitcherPlugin extends Plugin {
       showVaultTags: () => this.openVaultTagSwitcher(),
     };
 
-    new TagPickerModal(this.app, tags, (tag) => {
+    if (tags.length === 1) {
+      openSwitcherWithQuery(this.app, tags[0], backTargets);
+      return;
+    }
+
+    const entries: TagEntry[] = tags.map((tag) => ({ tag }));
+    new TagPickerModal(this.app, entries, (tag) => {
       openSwitcherWithQuery(this.app, tag, backTargets);
     }, backTargets).open();
   }
 
   // Idempotent counterpart: always shows every tag in the vault, however
-  // it's reached.
+  // it's reached. No single-tag skip here — an empty-or-one-tag vault is
+  // an edge case, not a case worth optimizing for like the per-note one is.
   private openVaultTagSwitcher(): void {
-    const tags = getAllVaultTags(this.app);
+    const entries = getAllVaultTags(this.app);
 
-    if (tags.length === 0) {
+    if (entries.length === 0) {
       new Notice("Tag Switcher: no tags found in this vault.");
       return;
     }
@@ -294,7 +321,7 @@ export default class TagSwitcherPlugin extends Plugin {
       showVaultTags: () => this.openVaultTagSwitcher(),
     };
 
-    new TagPickerModal(this.app, tags, (tag) => {
+    new TagPickerModal(this.app, entries, (tag) => {
       openSwitcherWithQuery(this.app, tag, backTargets);
     }, backTargets).open();
   }
