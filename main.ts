@@ -16,6 +16,7 @@ class TagPickerModal extends SuggestModal<string> {
     this.onChoose = onChoose;
   }
 
+
   getSuggestions(query: string): string[] {
     const q = query.toLowerCase();
     return this.tags.filter((t) => t.toLowerCase().includes(q));
@@ -53,6 +54,40 @@ function getTagsForActiveFile(app: App): string[] {
   return [...tags].sort();
 }
 
+// All tags known anywhere in the vault (frontmatter + inline), vault-wide.
+//
+// metadataCache.getTags() (returns { [tagWithHash]: count }) is NOT in the
+// public Obsidian type defs — it's undocumented, present since ~1.4, and
+// could change/disappear without notice. We cast through `any` and fall
+// back to a manual per-file scan if it's missing, so the plugin degrades
+// instead of throwing on some future Obsidian version.
+function getAllVaultTags(app: App): string[] {
+  const getTagsFn = (app.metadataCache as any).getTags;
+
+  if (typeof getTagsFn === "function") {
+    const tagCounts: Record<string, number> = getTagsFn.call(app.metadataCache);
+    return Object.entries(tagCounts)
+      .sort((a, b) => b[1] - a[1])
+      .map(([tag]) => tag);
+  }
+
+  // Fallback: walk every markdown file's cache and dedupe (documented APIs only).
+  const seen = new Map<string, number>();
+  for (const file of app.vault.getMarkdownFiles()) {
+    const cache = app.metadataCache.getFileCache(file);
+    if (!cache) continue;
+
+    if (cache.frontmatter?.tags) {
+      const ft = cache.frontmatter.tags;
+      const list = Array.isArray(ft) ? ft : typeof ft === "string" ? [ft] : [];
+      for (const t of list) seen.set("#" + t, (seen.get("#" + t) ?? 0) + 1);
+    }
+    cache.tags?.forEach((t) => seen.set(t.tag, (seen.get(t.tag) ?? 0) + 1));
+  }
+
+  return [...seen.entries()].sort((a, b) => b[1] - a[1]).map(([tag]) => tag);
+}
+
 // Find the best AYS command for tag-based search.
 // AYS generates command IDs dynamically as:
 //   obsidian-another-quick-switcher:search-command_${name.replace(/ /g,"-").toLowerCase()}
@@ -77,7 +112,13 @@ function findAYSTagCommand(app: App): string | null {
 
 // Open AYS with a pre-seeded query. Uses document.activeElement right after
 // the modal mounts — more reliable than a fixed CSS selector.
-function openSwitcherWithQuery(app: App, query: string): void {
+//
+// onBack, if given, wires Alt+Left inside the AYS input to close AYS and
+// invoke onBack (e.g. "reopen the tag list"). The listener is on the input
+// itself and removes itself on any close path (blur is not enough since AYS
+// may blur-then-refocus internally in some flows, so we also clean up via
+// a MutationObserver watching for the input leaving the DOM).
+function openSwitcherWithQuery(app: App, query: string, onBack?: () => void): void {
   const commands = (app as any).commands;
   const aysCommand = findAYSTagCommand(app);
 
@@ -93,6 +134,34 @@ function openSwitcherWithQuery(app: App, query: string): void {
     if (!input || input.tagName !== "INPUT") return;
     input.value = query + " ";
     input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+
+    if (!onBack) return;
+    const activeInput = input; // narrowed non-null, captured for closures below
+
+    const handleKeydown = (ev: KeyboardEvent) => {
+      if (!ev.altKey || ev.key !== "ArrowLeft") return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      cleanup();
+      // AYS closes itself on Escape; simulate that to back out cleanly
+      // before handing control back to the caller.
+      activeInput.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Escape", bubbles: true })
+      );
+      onBack();
+    };
+
+    const observer = new MutationObserver(() => {
+      if (!document.body.contains(activeInput)) cleanup();
+    });
+
+    function cleanup() {
+      activeInput.removeEventListener("keydown", handleKeydown, true);
+      observer.disconnect();
+    }
+
+    activeInput.addEventListener("keydown", handleKeydown, true);
+    observer.observe(document.body, { childList: true, subtree: true });
   }, 50);
 }
 
@@ -104,6 +173,12 @@ export default class TagSwitcherPlugin extends Plugin {
       id: "open-tag-switcher",
       name: "Switch file by tag menu",
       callback: () => this.openTagSwitcher(),
+    });
+
+    this.addCommand({
+      id: "open-vault-tag-switcher",
+      name: "Switch file by tag menu (all vault tags)",
+      callback: () => this.openVaultTagSwitcher(),
     });
   }
 
@@ -124,5 +199,25 @@ export default class TagSwitcherPlugin extends Plugin {
     new TagPickerModal(this.app, tags, (tag) => {
       openSwitcherWithQuery(this.app, tag);
     }).open();
+  }
+
+  // Vault-wide variant: always shows the picker (even for 1 tag, since
+  // "all tags" implies browsing, not a quick single-tag jump), and lets
+  // Alt+Left from inside AYS reopen this same picker.
+  private openVaultTagSwitcher(): void {
+    const tags = getAllVaultTags(this.app);
+
+    if (tags.length === 0) {
+      new Notice("Tag Switcher: no tags found in this vault.");
+      return;
+    }
+
+    const showPicker = () => {
+      new TagPickerModal(this.app, tags, (tag) => {
+        openSwitcherWithQuery(this.app, tag, showPicker);
+      }).open();
+    };
+
+    showPicker();
   }
 }
